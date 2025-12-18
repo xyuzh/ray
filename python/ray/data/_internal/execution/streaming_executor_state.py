@@ -533,7 +533,7 @@ def process_completed_tasks(
     states, call `update_operator_states()` afterwards.
 
     Args:
-        topology: The toplogy of operators.
+        topology: The topology of operators.
         backpressure_policies: The backpressure policies to use.
         max_errored_blocks: Max number of errored blocks to allow,
             unlimited if negative.
@@ -596,6 +596,9 @@ def process_completed_tasks(
                         if state in max_bytes_to_read_per_op:
                             max_bytes_to_read_per_op[state] -= bytes_read
                     except Exception as e:
+                        # Ensure task cleanup happens even on failure.
+                        task.finish(e)
+
                         num_errored_blocks += 1
                         should_ignore = (
                             max_errored_blocks < 0
@@ -672,7 +675,7 @@ def update_operator_states(topology: Topology) -> None:
         # Drain external input queue if current operator is execution finished.
         # This is needed when the limit is reached, and `mark_execution_finished`
         # is called manually.
-        if op.execution_finished():
+        if op.has_execution_finished():
             for input_queue in op_state.input_queues:
                 # Drain input queue
                 input_queue.clear()

@@ -167,8 +167,7 @@ class DataOpTask(OpTask):
                         timeout_s=0
                     )
                 except StopIteration:
-                    self._task_done_callback(None)
-                    self._has_finished = True
+                    self.finish(None)
                     break
 
                 if self._pending_block_ref.is_nil():
@@ -194,8 +193,7 @@ class DataOpTask(OpTask):
                         ray.get(self._pending_block_ref)
                         assert False, "Above ray.get should raise an exception."
                     except Exception as ex:
-                        self._task_done_callback(ex)
-                        self._has_finished = True
+                        self.finish(ex)
                         raise ex from None
 
                 if self._pending_meta_ref.is_nil():
@@ -239,6 +237,20 @@ class DataOpTask(OpTask):
             bytes_read += meta.size_bytes
 
         return bytes_read
+
+    def finish(self, exception: Optional[Exception] = None):
+        """Mark this task as finished and invoke the done callback.
+
+        This method is idempotent - calling it multiple times has no effect
+        after the first call.
+
+        Args:
+            exception: Optional exception that caused the task to finish.
+                If None, the task completed successfully.
+        """
+        if not self._has_finished:
+            self._task_done_callback(exception)
+            self._has_finished = True
 
     @property
     def has_finished(self) -> bool:
@@ -343,7 +355,7 @@ class PhysicalOperator(Operator):
         self._in_task_output_backpressure = False
         self._estimated_num_output_bundles = None
         self._estimated_output_num_rows = None
-        self._execution_finished = False
+        self._is_execution_marked_finished = False
         # The LogicalOperator(s) which were translated to create this PhysicalOperator.
         # Set via `PhysicalOperator.set_logical_operators()`.
         self._logical_operators: List[LogicalOperator] = []
@@ -401,48 +413,51 @@ class PhysicalOperator(Operator):
 
     def mark_execution_finished(self):
         """Manually mark that this operator has finished execution."""
-        self._execution_finished = True
+        self._is_execution_marked_finished = True
 
-    def execution_finished(self) -> bool:
+    def has_execution_finished(self) -> bool:
         """Return True when this operator has finished execution.
 
         The outputs may or may not have been taken.
         """
-        return self._execution_finished
+        from ..operators.base_physical_operator import InternalQueueOperatorMixin
+
+        internal_input_queue_num_blocks = 0
+        if isinstance(self, InternalQueueOperatorMixin):
+            internal_input_queue_num_blocks = self.internal_input_queue_num_blocks()
+
+        # NOTE: Execution is considered finished if
+        #   - The operator was explicitly marked finished OR
+        #   - The following auto-completion conditions are met
+        #       - All input blocks have been ingested
+        #       - Internal queue is empty
+        #       - There are no active or pending tasks
+
+        return self._is_execution_marked_finished or (
+            self._inputs_complete
+            and self.num_active_tasks() == 0
+            and internal_input_queue_num_blocks == 0
+        )
 
     def completed(self) -> bool:
         """Returns whether this operator has been fully completed.
 
         An operator is completed iff:
-            * The operator has finished execution (i.e., `execution_finished()` is True).
+            * The operator has finished execution (i.e., `has_execution_finished()` is True).
             * All outputs have been taken (i.e., `has_next()` is False) from it.
         """
         from ..operators.base_physical_operator import InternalQueueOperatorMixin
 
-        internal_input_queue_num_blocks = 0
         internal_output_queue_num_blocks = 0
         if isinstance(self, InternalQueueOperatorMixin):
-            internal_input_queue_num_blocks = self.internal_input_queue_num_blocks()
             internal_output_queue_num_blocks = self.internal_output_queue_num_blocks()
-
-        if not self._execution_finished:
-            if (
-                self._inputs_complete
-                and internal_input_queue_num_blocks == 0
-                and self.num_active_tasks() == 0
-            ):
-                # NOTE: Operator is considered completed iff
-                #   - All input blocks have been ingested
-                #   - Internal queue is empty
-                #   - There are no active or pending tasks
-                self._execution_finished = True
 
         # NOTE: We check for (internal_output_queue_size == 0) and
         # (not self.has_next()) because _OrderedOutputQueue can
         # return False for self.has_next(), but have a non-empty queue size.
         # Draining the internal output queue is important to free object refs.
         return (
-            self._execution_finished
+            self.has_execution_finished()
             and not self.has_next()
             and internal_output_queue_num_blocks == 0
         )
@@ -486,7 +501,7 @@ class PhysicalOperator(Operator):
         """
         return ExecutionResources.zero()
 
-    def max_task_concurrency(self: "PhysicalOperator") -> Optional[int]:
+    def get_max_concurrency_limit(self: "PhysicalOperator") -> Optional[int]:
         """The maximum number of tasks that can be run concurrently.
 
         Some operators manually configure a maximum concurrency. For example, if you
@@ -812,11 +827,6 @@ class PhysicalOperator(Operator):
             op.num_outputs_total() or 0 for op in self.input_dependencies
         )
         return upstream_op_num_outputs
-
-    def get_max_concurrency_limit(self) -> Optional[int]:
-        """Max value of how many tasks this operator could run
-        concurrently (if limited)"""
-        return None
 
 
 class ReportsExtraResourceUsage(abc.ABC):
