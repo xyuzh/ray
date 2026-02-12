@@ -21,6 +21,7 @@ from ray.data.expressions import (
     ColumnExpr,
     DownloadExpr,
     LiteralExpr,
+    MonotonicallyIncreasingIdExpr,
     Operation,
     StarExpr,
     UDFExpr,
@@ -76,6 +77,8 @@ if TYPE_CHECKING:
     from pyiceberg.schema import Schema
     from pyiceberg.table import DataScan, FileScanTask, Table
     from pyiceberg.table.metadata import TableMetadata
+
+    from ray.data.context import DataContext
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +175,14 @@ class _IcebergExpressionVisitor(
         """Star expressions cannot be converted to Iceberg expressions."""
         raise TypeError(
             "Star expressions cannot be converted to Iceberg filter expressions."
+        )
+
+    def visit_monotonically_increasing_id(
+        self, expr: "MonotonicallyIncreasingIdExpr"
+    ) -> "BooleanExpression | UnboundTerm[Any] | Literal[Any]":
+        """Monotonically increasing ID expressions cannot be converted to Iceberg expressions."""
+        raise TypeError(
+            "monotonically_increasing_id expressions cannot be converted to Iceberg filter expressions."
         )
 
 
@@ -408,7 +419,10 @@ class IcebergDatasource(Datasource):
         return chunks
 
     def get_read_tasks(
-        self, parallelism: int, per_task_row_limit: Optional[int] = None
+        self,
+        parallelism: int,
+        per_task_row_limit: Optional[int] = None,
+        data_context: Optional["DataContext"] = None,
     ) -> List[ReadTask]:
         from pyiceberg.io import pyarrow as pyi_pa_io
         from pyiceberg.manifest import DataFileContent
@@ -429,8 +443,7 @@ class IcebergDatasource(Datasource):
         if parallelism > len(list(plan_files)):
             parallelism = len(list(plan_files))
             logger.warning(
-                f"Reducing the parallelism to {parallelism}, as that is the"
-                "number of files"
+                f"Reducing the parallelism to {parallelism}, as that is the number of files"
             )
 
         # Get required properties for reading tasks - table IO, table metadata,

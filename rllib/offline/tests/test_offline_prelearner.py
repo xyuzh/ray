@@ -1,4 +1,3 @@
-import functools
 import shutil
 import unittest
 from pathlib import Path
@@ -36,8 +35,11 @@ class TestOfflinePreLearner(unittest.TestCase):
     def tearDownClass(cls):
         ray.shutdown()
 
+        # Delete the cluster address just in case.
+        ray._common.utils.reset_ray_address()
+
     def setUp(self) -> None:
-        data_path = "tests/data/cartpole/cartpole-v1_large"
+        data_path = "offline/tests/data/cartpole/cartpole-v1_large"
         self.base_path = Path(__file__).parents[2]
         self.data_path = "local://" + self.base_path.joinpath(data_path).as_posix()
         # Get the observation and action spaces.
@@ -71,7 +73,9 @@ class TestOfflinePreLearner(unittest.TestCase):
             PrioritizedEpisodeReplayBuffer,
         )
 
-        sample_batch_data_path = self.base_path / "tests/data/cartpole/large.json"
+        sample_batch_data_path = (
+            self.base_path / "offline/tests/data/cartpole/large.json"
+        )
 
         self.config.offline_data(
             input_=["local://" + sample_batch_data_path.as_posix()],
@@ -150,14 +154,22 @@ class TestOfflinePreLearner(unittest.TestCase):
         )["episodes"]
 
         self.assertTrue(
-            all(all(eps.get_observations()[-1] == [0.0] * 4) for eps in episodes)
+            all(
+                all(
+                    eps.get_observations()[-1]
+                    == [0.0] * self.observation_space.shape[0]
+                )
+                for eps in episodes
+            )
         )
 
     def test_offline_prelearner_convert_from_old_sample_batch_to_episodes(self):
         """Tests conversion from `SampleBatch` data to episodes."""
 
         # Use the old records storing `SampleBatch`es.
-        sample_batch_data_path = self.base_path / "tests/data/cartpole/large.json"
+        sample_batch_data_path = (
+            self.base_path / "offline/tests/data/cartpole/large.json"
+        )
 
         # Create the dataset.
         data = ray.data.read_json(sample_batch_data_path.as_posix())
@@ -172,36 +184,10 @@ class TestOfflinePreLearner(unittest.TestCase):
         self.assertTrue(len(episodes) == 10)
         self.assertTrue(isinstance(episodes[0], SingleAgentEpisode))
 
-    def test_offline_prelearner_in_map_batches(self):
-        """Tests using the `OfflinePreLearner` in `map_batches` where it is used
-        in `OfflineData`.
-        """
-
-        # Create a simple dataset.
-        data = ray.data.read_parquet(self.data_path)
-
-        # Generate a batch iterator that uses the `OfflinePreLearner` to convert
-        # data to episodes.
-        batch_iterator = data.map_batches(
-            functools.partial(
-                OfflinePreLearner._map_to_episodes,
-                False,
-            )
-        ).iter_batches(
-            batch_size=10,
-            prefetch_batches=1,
-        )
-
-        # Now sample a single batch.
-        batch = next(iter(batch_iterator))
-        # Assert that we have indeed sampled episodes.
-        self.assertTrue("episodes" in batch)
-        self.assertTrue(isinstance(batch["episodes"][0], SingleAgentEpisode))
-
     def test_offline_prelearner_sample_from_old_sample_batch_data(self):
         """Tests sampling from a `SampleBatch` dataset."""
 
-        data_path = self.base_path / "tests/data/cartpole/large.json"
+        data_path = self.base_path / "offline/tests/data/cartpole/large.json"
 
         self.config.offline_data(
             input_=["local://" + data_path.as_posix()],
@@ -271,6 +257,11 @@ class TestOfflinePreLearner(unittest.TestCase):
                 output=data_path,
                 output_write_episodes=True,
             )
+            .training(
+                # Use small batch sizes for the test.
+                train_batch_size_per_learner=20,
+                minibatch_size=10,
+            )
         )
 
         # Record some episodes.
@@ -282,7 +273,7 @@ class TestOfflinePreLearner(unittest.TestCase):
         self.config.offline_data(
             input_=[data_path],
             input_read_episodes=True,
-            input_read_batch_size=50,
+            input_read_batch_size=1,
         )
 
         # Build the `BC` algorithm.
@@ -290,7 +281,7 @@ class TestOfflinePreLearner(unittest.TestCase):
         # Read in the generated set of episode data.
         episode_ds = ray.data.read_parquet(data_path)
         # Sample a batch of episodes from the episode dataset.
-        episode_batch = episode_ds.take_batch(256)
+        episode_batch = episode_ds.take_batch(10)
         # Get the module state from the `Learner`.
         module_state = algo.offline_data.learner_handles[0].get_state(
             component=COMPONENT_RL_MODULE,

@@ -16,13 +16,14 @@ from ray.serve._private.proxy import (
     ResponseStatus,
     gRPCProxy,
 )
-from ray.serve._private.proxy_request_response import ProxyRequest
+from ray.serve._private.proxy_request_response import ProxyRequest, gRPCStreamingType
 from ray.serve._private.proxy_router import (
     NO_REPLICAS_MESSAGE,
     NO_ROUTES_MESSAGE,
     ProxyRouter,
 )
 from ray.serve._private.test_utils import FakeGrpcContext, MockDeploymentHandle
+from ray.serve._private.thirdparty.get_asgi_route_name import RoutePattern
 from ray.serve.generated import serve_pb2
 from ray.serve.grpc_util import RayServegRPCContext
 
@@ -380,7 +381,8 @@ class TestgRPCProxy:
         grpc_proxy = self.create_grpc_proxy()
         request_proto = serve_pb2.UserDefinedMessage(name="foo", num=30, foo="bar")
         unary_entrypoint = grpc_proxy.service_handler_factory(
-            service_method="service_method", stream=False
+            service_method="service_method",
+            streaming_type=gRPCStreamingType.UNARY_UNARY,
         )
         assert unary_entrypoint.__name__ == "unary_unary"
 
@@ -401,7 +403,8 @@ class TestgRPCProxy:
 
         # Ensure gRPC streaming call uses the correct entry point.
         streaming_entrypoint = grpc_proxy.service_handler_factory(
-            service_method="service_method", stream=True
+            service_method="service_method",
+            streaming_type=gRPCStreamingType.UNARY_STREAM,
         )
         assert streaming_entrypoint.__name__ == "unary_stream"
 
@@ -829,9 +832,9 @@ class TestProxyRouterMatchRoutePattern:
                 DeploymentID("api", "default"): EndpointInfo(
                     route="/api",
                     route_patterns=[
-                        "/api/",
-                        "/api/users/{user_id}",
-                        "/api/items/{item_id}/details",
+                        RoutePattern(methods=None, path="/api/"),
+                        RoutePattern(methods=None, path="/api/users/{user_id}"),
+                        RoutePattern(methods=None, path="/api/items/{item_id}/details"),
                     ],
                 )
             }
@@ -859,7 +862,9 @@ class TestProxyRouterMatchRoutePattern:
             {
                 DeploymentID("api", "default"): EndpointInfo(
                     route="/api",
-                    route_patterns=["/api/users/{user_id}"],
+                    route_patterns=[
+                        RoutePattern(methods=None, path="/api/users/{user_id}")
+                    ],
                 )
             }
         )
@@ -885,7 +890,9 @@ class TestProxyRouterMatchRoutePattern:
             {
                 DeploymentID("api", "default"): EndpointInfo(
                     route="/api",
-                    route_patterns=["/api/users/{user_id}"],
+                    route_patterns=[
+                        RoutePattern(methods=None, path="/api/users/{user_id}")
+                    ],
                 )
             }
         )
@@ -899,7 +906,9 @@ class TestProxyRouterMatchRoutePattern:
             {
                 DeploymentID("api", "default"): EndpointInfo(
                     route="/api",
-                    route_patterns=["/api/items/{item_id}"],
+                    route_patterns=[
+                        RoutePattern(methods=None, path="/api/items/{item_id}")
+                    ],
                 )
             }
         )
@@ -927,7 +936,9 @@ class TestProxyRouterMatchRoutePattern:
             {
                 DeploymentID("api", "default"): EndpointInfo(
                     route="/api",
-                    route_patterns=["/api/users/{user_id}"],
+                    route_patterns=[
+                        RoutePattern(methods=None, path="/api/users/{user_id}")
+                    ],
                 )
             }
         )
