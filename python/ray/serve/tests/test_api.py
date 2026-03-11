@@ -7,10 +7,10 @@ import httpx
 import pytest
 import starlette.responses
 from fastapi import FastAPI
+from pydantic import BaseModel, ValidationError
 
 import ray
 from ray import serve
-from ray._common.pydantic_compat import BaseModel, ValidationError
 from ray._common.test_utils import SignalActor, wait_for_condition
 from ray.serve._private.api import call_user_app_builder_with_args_if_necessary
 from ray.serve._private.common import DeploymentID
@@ -28,7 +28,7 @@ from ray.serve._private.request_router.request_router import (
     RequestRouter,
 )
 from ray.serve._private.test_utils import get_application_url
-from ray.serve.config import RequestRouterConfig
+from ray.serve.config import GangSchedulingConfig, RequestRouterConfig
 from ray.serve.deployment import Application
 from ray.serve.exceptions import RayServeException
 from ray.serve.handle import DeploymentHandle
@@ -71,6 +71,50 @@ class AsyncCounter:
         self.count += 1
         await asyncio.sleep(0.01)
         return {"count": self.count}
+
+
+def test_ingress_wrapper_preserves_metadata():
+    app = FastAPI()
+
+    class OriginalIngress:
+        """Sample ingress class."""
+
+        value: int
+
+    wrapped_cls = serve.ingress(app)(OriginalIngress)
+
+    assert wrapped_cls.__name__ == OriginalIngress.__name__
+    assert wrapped_cls.__qualname__ == OriginalIngress.__qualname__
+    assert wrapped_cls.__module__ == OriginalIngress.__module__
+    assert wrapped_cls.__doc__ == OriginalIngress.__doc__
+    assert wrapped_cls.__annotations__ == OriginalIngress.__annotations__
+    assert getattr(wrapped_cls, "__wrapped__", None) is OriginalIngress
+
+
+def test_ingress_async_init(serve_instance):
+    """Test that async __init__ works correctly with @serve.ingress.
+
+    Without the fix, cls.__init__() returns a coroutine that is silently
+    discarded, so self.msg is never set and the /check endpoint raises
+    AttributeError.
+    """
+    app = FastAPI()
+
+    @serve.deployment
+    @serve.ingress(app)
+    class MyDeployment:
+        async def __init__(self):
+            await asyncio.sleep(0.01)
+            self.msg = "initialized"
+
+        @app.get("/check")
+        async def check(self):
+            return self.msg
+
+    serve.run(MyDeployment.bind())
+    resp = httpx.get(f"{get_application_url()}/check")
+    assert resp.status_code == 200
+    assert resp.json() == "initialized"
 
 
 class FakeRequestRouter(RequestRouter):
@@ -610,7 +654,7 @@ class TestAppBuilder:
 
     class TypedArgs(BaseModel):
         message: str
-        num_replicas: Optional[int]
+        num_replicas: Optional[int] = None
 
     def test_prebuilt_app(self):
         a = self.A.bind()
@@ -759,23 +803,16 @@ class TestAppBuilder:
         def check_missing_required(args: self.TypedArgs):
             assert False, "Shouldn't get here because validation failed."
 
-        with pytest.raises(ValidationError, match="field required"):
+        # Pydantic v2 uses "Field required" (capitalized)
+        with pytest.raises(ValidationError, match="Field required"):
             call_user_app_builder_with_args_if_necessary(
                 check_missing_required, {"num_replicas": "10"}
             )
 
-    @pytest.mark.parametrize("use_v1_patch", [True, False])
-    def test_pydantic_version_compatibility(self, use_v1_patch: bool):
-        """Check compatibility with different pydantic versions."""
+    def test_pydantic_version_compatibility(self):
+        """Check compatibility with pydantic v2."""
 
-        if use_v1_patch:
-            try:
-                # Only runs if installed pydantic version is >=2.5.0
-                from pydantic.v1 import BaseModel
-            except ImportError:
-                return
-        else:
-            from pydantic import BaseModel
+        from pydantic import BaseModel
 
         cat_dict = {"color": "orange", "age": 10}
 
@@ -842,6 +879,124 @@ def test_mutually_exclusive_max_replicas_per_node_and_placement_group_bundles():
             pass
 
         g.options(max_replicas_per_node=3, placement_group_bundles=[{"CPU": 1}])
+
+
+def test_mutually_exclusive_max_replicas_per_node_and_gang_scheduling_config():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Setting max_replicas_per_node is not allowed when "
+            "gang_scheduling_config is provided."
+        ),
+    ):
+
+        @serve.deployment(
+            max_replicas_per_node=3,
+            num_replicas=4,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class A:
+            pass
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Setting max_replicas_per_node is not allowed when "
+            "gang_scheduling_config is provided."
+        ),
+    ):
+
+        @serve.deployment
+        class B:
+            pass
+
+        B.options(
+            max_replicas_per_node=3,
+            num_replicas=4,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+
+
+def test_mutually_exclusive_max_replicas_per_node_and_gang_scheduling_config_merged():
+    """Verify the check catches conflicts from the merged config."""
+
+    @serve.deployment(max_replicas_per_node=1, num_replicas=2)
+    class A:
+        pass
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Setting max_replicas_per_node is not allowed when "
+            "gang_scheduling_config is provided."
+        ),
+    ):
+        A.options(
+            num_replicas=2,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+
+
+def test_mutually_exclusive_placement_group_strategy_and_gang_scheduling_config():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Setting placement_group_strategy is not allowed when "
+            "gang_scheduling_config is provided."
+        ),
+    ):
+
+        @serve.deployment(
+            placement_group_strategy="SPREAD",
+            placement_group_bundles=[{"CPU": 1}],
+            num_replicas=4,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class A:
+            pass
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Setting placement_group_strategy is not allowed when "
+            "gang_scheduling_config is provided."
+        ),
+    ):
+
+        @serve.deployment
+        class B:
+            pass
+
+        B.options(
+            placement_group_strategy="SPREAD",
+            placement_group_bundles=[{"CPU": 1}],
+            num_replicas=4,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+
+
+def test_mutually_exclusive_placement_group_strategy_and_gang_scheduling_config_merged():
+    """Verify the check catches conflicts from the merged config."""
+
+    @serve.deployment(
+        placement_group_strategy="SPREAD",
+        placement_group_bundles=[{"CPU": 1}],
+        num_replicas=2,
+    )
+    class A:
+        pass
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Setting placement_group_strategy is not allowed when "
+            "gang_scheduling_config is provided."
+        ),
+    ):
+        A.options(
+            num_replicas=2,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
 
 
 def test_status_basic(serve_instance):
@@ -1217,6 +1372,64 @@ def test_max_constructor_retry_count(serve_instance):
     # we are triggering 3 replicas at once, and for understanding, let's assume then only one replica fail 7 times,
     # hence total count should be 7(one replica with 7 failures and 2 replicas with 0 failures) = 9
     wait_for_condition(lambda: ray.get(counter.get_count.remote()) == 9)
+
+
+def test_run_with_external_scaler_enabled(serve_instance):
+    """Test that serve.run correctly passes external_scaler_enabled parameter.
+
+    This test verifies that when serve.run is called with external_scaler_enabled=True
+    or external_scaler_enabled=False, the application state manager correctly stores
+    the external_scaler_enabled value.
+    """
+    controller = serve_instance._controller
+
+    @serve.deployment
+    class Model:
+        def __call__(self):
+            return "model response"
+
+    # Test with external_scaler_enabled=True
+    handle = serve.run(
+        Model.bind(),
+        name="app_with_scaler",
+        route_prefix="/with_scaler",
+        external_scaler_enabled=True,
+    )
+    assert handle.remote().result() == "model response"
+
+    # Verify that external_scaler_enabled is set to True
+    assert (
+        ray.get(controller.get_external_scaler_enabled.remote("app_with_scaler"))
+        is True
+    )
+
+    # Test with external_scaler_enabled=False (explicit)
+    handle = serve.run(
+        Model.bind(),
+        name="app_without_scaler",
+        route_prefix="/without_scaler",
+        external_scaler_enabled=False,
+    )
+    assert handle.remote().result() == "model response"
+
+    # Verify that external_scaler_enabled is set to False
+    assert (
+        ray.get(controller.get_external_scaler_enabled.remote("app_without_scaler"))
+        is False
+    )
+
+    # Test with default value (should be False)
+    handle = serve.run(
+        Model.bind(),
+        name="app_default",
+        route_prefix="/default",
+    )
+    assert handle.remote().result() == "model response"
+
+    # Verify that external_scaler_enabled defaults to False
+    assert (
+        ray.get(controller.get_external_scaler_enabled.remote("app_default")) is False
+    )
 
 
 if __name__ == "__main__":

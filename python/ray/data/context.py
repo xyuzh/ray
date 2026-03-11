@@ -1,21 +1,22 @@
+import contextlib
 import copy
 import enum
+import importlib
 import logging
 import os
 import threading
 import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
-import ray
-from ray._private.ray_constants import env_bool, env_float, env_integer
-from ray._private.worker import WORKER_MODE
+from ray._common.utils import env_bool, env_float, env_integer
 from ray.data._internal.logging import update_dataset_logger_for_worker
+from ray.data.checkpoint import CheckpointBackend, CheckpointConfig
 from ray.util.annotations import DeveloperAPI
-from ray.util.debug import log_once
 from ray.util.scheduling_strategies import SchedulingStrategyT
 
 if TYPE_CHECKING:
+    from ray.data._internal.execution.execution_callback import ExecutionCallback
     from ray.data._internal.execution.interfaces import ExecutionOptions
     from ray.data._internal.issue_detection.issue_detector_configuration import (
         IssueDetectorsConfiguration,
@@ -55,12 +56,6 @@ DEFAULT_SHUFFLE_TARGET_MAX_BLOCK_SIZE = 1024 * 1024 * 1024
 # target_max_block_size. We will warn the user if slicing fails and we produce
 # blocks larger than this threshold.
 MAX_SAFE_BLOCK_SIZE_FACTOR = 1.5
-
-# We will attempt to slice blocks whose size exceeds this factor *
-# target_num_rows_per_block. We will warn the user if slicing fails and we produce
-# blocks with more rows than this threshold.
-MAX_SAFE_ROWS_PER_BLOCK_FACTOR = 1.5
-
 
 DEFAULT_TARGET_MIN_BLOCK_SIZE = 1 * 1024 * 1024
 
@@ -172,9 +167,42 @@ DEFAULT_RETRIED_IO_ERRORS = (
     "AWS Error SERVICE_UNAVAILABLE",
 )
 
+DEFAULT_ICEBERG_WRITE_FILE_MAX_ATTEMPTS = env_integer(
+    "RAY_DATA_ICEBERG_WRITE_FILE_MAX_ATTEMPTS", 10
+)
+DEFAULT_ICEBERG_WRITE_FILE_RETRY_MAX_BACKOFF_S = env_integer(
+    "RAY_DATA_ICEBERG_WRITE_FILE_RETRY_MAX_BACKOFF_S", 32
+)
+
+DEFAULT_ICEBERG_CATALOG_MAX_ATTEMPTS = env_integer(
+    "RAY_DATA_ICEBERG_CATALOG_MAX_ATTEMPTS", 5
+)
+DEFAULT_ICEBERG_CATALOG_RETRY_MAX_BACKOFF_S = env_integer(
+    "RAY_DATA_ICEBERG_CATALOG_RETRY_MAX_BACKOFF_S", 16
+)
+DEFAULT_ICEBERG_CATALOG_RETRIED_ERRORS = (
+    "429",
+    "503",
+    "502",
+    "500",
+    "Too Many Requests",
+    "Service Unavailable",
+    "Internal Server Error",
+    "Connection reset",
+    "Connection refused",
+    "Connection timed out",
+    "Read timed out",
+    "UNAVAILABLE",
+    "DEADLINE_EXCEEDED",
+)
+
 DEFAULT_WARN_ON_DRIVER_MEMORY_USAGE_BYTES = 2 * 1024 * 1024 * 1024
 
 DEFAULT_ACTOR_TASK_RETRY_ON_ERRORS = False
+
+DEFAULT_ACTOR_INIT_RETRY_ON_ERRORS = False
+
+DEFAULT_ACTOR_INIT_MAX_RETRIES = 3
 
 DEFAULT_ENABLE_OP_RESOURCE_RESERVATION = env_bool(
     "RAY_DATA_ENABLE_OP_RESOURCE_RESERVATION", True
@@ -229,10 +257,13 @@ DEFAULT_HASH_SHUFFLE_AGGREGATOR_HEALTH_WARNING_INTERVAL_S = env_integer(
     "RAY_DATA_HASH_SHUFFLE_AGGREGATOR_HEALTH_WARNING_INTERVAL_S", 30
 )
 
+# Environment variable for custom execution callbacks
+EXECUTION_CALLBACKS_ENV_VAR = "RAY_DATA_EXECUTION_CALLBACKS"
+
 
 DEFAULT_ACTOR_POOL_UTIL_UPSCALING_THRESHOLD: float = env_float(
     "RAY_DATA_DEFAULT_ACTOR_POOL_UTIL_UPSCALING_THRESHOLD",
-    2.0,
+    1.75,
 )
 
 DEFAULT_ACTOR_POOL_UTIL_DOWNSCALING_THRESHOLD: float = env_float(
@@ -246,9 +277,45 @@ DEFAULT_ACTOR_POOL_MAX_UPSCALING_DELTA: int = env_integer(
 )
 
 
+# Disable dynamic output queue size backpressure by default.
 DEFAULT_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE: bool = env_bool(
     "RAY_DATA_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE", False
 )
+
+
+DEFAULT_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO: float = env_float(
+    "RAY_DATA_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO", 10.0
+)
+
+
+@DeveloperAPI
+@dataclass
+class IcebergConfig:
+    """Configuration for Iceberg datasource operations.
+
+    Args:
+        write_file_max_attempts: Maximum number of retry attempts when writing
+            Iceberg data files to storage. Defaults to 10.
+        write_file_retry_max_backoff_s: Maximum backoff time in seconds between
+            Iceberg write retry attempts. Uses exponential backoff with jitter.
+            Defaults to 32.
+        catalog_max_attempts: Maximum number of retry attempts for Iceberg
+            catalog operations (load catalog, load table, commit transactions).
+            Defaults to 5.
+        catalog_retry_max_backoff_s: Maximum backoff time in seconds between
+            Iceberg catalog retry attempts. Defaults to 16.
+        catalog_retried_errors: A list of substrings of error messages that
+            should trigger a retry for Iceberg catalog operations. Includes common
+            HTTP error codes and connection errors.
+    """
+
+    write_file_max_attempts: int = DEFAULT_ICEBERG_WRITE_FILE_MAX_ATTEMPTS
+    write_file_retry_max_backoff_s: int = DEFAULT_ICEBERG_WRITE_FILE_RETRY_MAX_BACKOFF_S
+    catalog_max_attempts: int = DEFAULT_ICEBERG_CATALOG_MAX_ATTEMPTS
+    catalog_retry_max_backoff_s: int = DEFAULT_ICEBERG_CATALOG_RETRY_MAX_BACKOFF_S
+    catalog_retried_errors: List[str] = field(
+        default_factory=lambda: list(DEFAULT_ICEBERG_CATALOG_RETRIED_ERRORS)
+    )
 
 
 @DeveloperAPI
@@ -396,7 +463,9 @@ class DataContext:
         enable_rich_progress_bars: Whether to use the new rich progress bars instead
             of the tqdm TUI.
         enable_get_object_locations_for_metrics: Whether to enable
-            ``get_object_locations`` for metrics.
+            ``get_object_locations`` for metrics. This is useful for tracking whether
+            the object input of a task is local (cache hit) or not local (cache miss)
+            to the node that task is running on.
         write_file_retry_on_errors: A list of substrings of error messages that should
             trigger a retry when writing files. This is useful for handling transient
             errors when writing to remote storage systems.
@@ -407,6 +476,12 @@ class DataContext:
             retry. This follows same format as :ref:`retry_exceptions <task-retries>` in
             Ray Core. Default to `False` to not retry on any errors. Set to `True` to
             retry all errors, or set to a list of errors to retry.
+        actor_init_retry_on_errors: Whether to retry when actor initialization fails.
+            Default to `False` to not retry on any errors. Set to `True` to retry
+            all errors.
+        actor_init_max_retries: Maximum number of consecutive retries for actor
+            initialization failures. The counter resets when an actor successfully
+            initializes. Default is 3. Set to -1 for infinite retries.
         op_resource_reservation_enabled: Whether to enable resource reservation for
             operators to prevent resource contention.
         op_resource_reservation_ratio: The ratio of the total resources to reserve for
@@ -438,6 +513,9 @@ class DataContext:
         retried_io_errors: A list of substrings of error messages that should
             trigger a retry when reading or writing files. This is useful for handling
             transient errors when reading from remote storage systems.
+        iceberg_config: Configuration for Iceberg datasource operations including
+            retry settings for file writes and catalog operations. See
+            :class:`IcebergConfig` for details.
         default_hash_shuffle_parallelism: Default parallelism level for hash-based
             shuffle operations if the number of partitions is unspecifed.
         max_hash_shuffle_aggregators: Maximum number of aggregating actors that can be
@@ -468,11 +546,9 @@ class DataContext:
             dataset operations.
         downstream_capacity_backpressure_ratio: Ratio for downstream capacity
             backpressure control. A higher ratio causes backpressure to kick-in
-            later. If `None`, this type of backpressure is disabled.
-        downstream_capacity_backpressure_max_queued_bundles: Maximum number of queued
-            bundles before applying backpressure. If `None`, no limit is applied.
+            later. If `None`, this backpressure policy is disabled.
         enable_dynamic_output_queue_size_backpressure: Whether to cap the concurrency
-        of an operator based on it's and downstream's queue size.
+            of an operator based on its and downstream operators' queue size.
         enforce_schemas: Whether to enforce schema consistency across dataset operations.
         pandas_block_ignore_metadata: Whether to ignore pandas metadata when converting
             between Arrow and pandas formats for better type inference.
@@ -558,8 +634,6 @@ class DataContext:
     use_ray_tqdm: bool = DEFAULT_USE_RAY_TQDM
     enable_progress_bars: bool = DEFAULT_ENABLE_PROGRESS_BARS
     # By default, enable the progress bar for operator-level progress.
-    # In __post_init__(), we disable operator-level progress
-    # bars when running in a Ray job.
     enable_operator_progress_bars: bool = True
     enable_progress_bar_name_truncation: bool = (
         DEFAULT_ENABLE_PROGRESS_BAR_NAME_TRUNCATION
@@ -573,6 +647,8 @@ class DataContext:
     actor_task_retry_on_errors: Union[
         bool, List[BaseException]
     ] = DEFAULT_ACTOR_TASK_RETRY_ON_ERRORS
+    actor_init_retry_on_errors: bool = DEFAULT_ACTOR_INIT_RETRY_ON_ERRORS
+    actor_init_max_retries: int = DEFAULT_ACTOR_INIT_MAX_RETRIES
     op_resource_reservation_enabled: bool = DEFAULT_ENABLE_OP_RESOURCE_RESERVATION
     op_resource_reservation_ratio: float = DEFAULT_OP_RESOURCE_RESERVATION_RATIO
     max_errored_blocks: int = DEFAULT_MAX_ERRORED_BLOCKS
@@ -594,6 +670,7 @@ class DataContext:
     retried_io_errors: List[str] = field(
         default_factory=lambda: list(DEFAULT_RETRIED_IO_ERRORS)
     )
+    iceberg_config: IcebergConfig = field(default_factory=IcebergConfig)
     enable_per_node_metrics: bool = DEFAULT_ENABLE_PER_NODE_METRICS
     override_object_store_memory_limit_fraction: float = None
     memory_usage_poll_interval_s: Optional[float] = 1
@@ -609,8 +686,9 @@ class DataContext:
         default_factory=_issue_detectors_config_factory
     )
 
-    downstream_capacity_backpressure_ratio: float = None
-    downstream_capacity_backpressure_max_queued_bundles: int = None
+    downstream_capacity_backpressure_ratio: Optional[
+        float
+    ] = DEFAULT_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO
 
     enable_dynamic_output_queue_size_backpressure: bool = (
         DEFAULT_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE
@@ -619,6 +697,12 @@ class DataContext:
     enforce_schemas: bool = DEFAULT_ENFORCE_SCHEMAS
 
     pandas_block_ignore_metadata: bool = DEFAULT_PANDAS_BLOCK_IGNORE_METADATA
+
+    _checkpoint_config: Optional[CheckpointConfig] = None
+
+    custom_execution_callback_classes: List[Type["ExecutionCallback"]] = field(
+        default_factory=list
+    )
 
     def __post_init__(self):
         # The additonal ray remote args that should be added to
@@ -631,31 +715,22 @@ class DataContext:
         # the DataContext from the plugin implementations, as well as to avoid
         # circular dependencies.
         self._kv_configs: Dict[str, Any] = {}
+
+        # Sync hash shuffle aggregator fields to its detector config
+        self.issue_detectors_config.hash_shuffle_detector_config.detection_time_interval_s = (
+            self.hash_shuffle_aggregator_health_warning_interval_s
+        )
+        self.issue_detectors_config.hash_shuffle_detector_config.min_wait_time_s = (
+            self.min_hash_shuffle_aggregator_wait_time_in_s
+        )
+
         self._max_num_blocks_in_streaming_gen_buffer = (
             DEFAULT_MAX_NUM_BLOCKS_IN_STREAMING_GEN_BUFFER
         )
 
-        is_ray_job = os.environ.get("RAY_JOB_ID") is not None
-        if is_ray_job:
-            is_driver = ray.get_runtime_context().worker.mode != WORKER_MODE
-            if is_driver and log_once(
-                "ray_data_disable_operator_progress_bars_in_ray_jobs"
-            ):
-                logger.info(
-                    "Disabling operator-level progress bars by default in Ray Jobs. "
-                    "To enable progress bars for all operators, set "
-                    "`ray.data.DataContext.get_current()"
-                    ".enable_operator_progress_bars = True`."
-                )
-            # Disable operator-level progress bars by default in Ray jobs.
-            # The global progress bar for the overall Dataset execution will
-            # still be enabled, unless the user also sets
-            # `ray.data.DataContext.get_current().enable_progress_bars = False`.
-            self.enable_operator_progress_bars = False
-        else:
-            # When not running in Ray job, operator-level progress
-            # bars are enabled by default.
-            self.enable_operator_progress_bars = True
+        # Unique id of the current execution of the data pipeline.
+        # This value increments only upon re-execution of the exact same pipeline.
+        self._execution_idx = 0
 
     def __setattr__(self, name: str, value: Any) -> None:
         if (
@@ -730,19 +805,33 @@ class DataContext:
             return _default_context
 
     @staticmethod
-    def _set_current(context: "DataContext") -> None:
+    @contextlib.contextmanager
+    def current(context: "DataContext"):
+        prev: Optional[DataContext] = DataContext._set_current(context)
+        try:
+            yield
+        finally:
+            DataContext._set_current(prev)
+
+    @staticmethod
+    def _set_current(context: Optional["DataContext"]) -> Optional["DataContext"]:
         """Set the current context in a remote worker.
 
         This is used internally by Dataset to propagate the driver context to
         remote workers used for parallelization.
         """
         global _default_context
-        if (
+        if context and (
             not _default_context
             or _default_context.dataset_logger_id != context.dataset_logger_id
         ):
             update_dataset_logger_for_worker(context.dataset_logger_id)
+
+        prev = _default_context
+        # Update current context
         _default_context = context
+
+        return prev
 
     @property
     def shuffle_strategy(self) -> ShuffleStrategy:
@@ -759,6 +848,69 @@ class DataContext:
     @shuffle_strategy.setter
     def shuffle_strategy(self, value: ShuffleStrategy) -> None:
         self._shuffle_strategy = value
+
+    @property
+    def execution_callback_classes(self) -> List[Type["ExecutionCallback"]]:
+        """Get the complete registry of execution callback classes.
+
+        This property gathers all callback classes that should be instantiated
+        by the execution planner. It includes:
+        1. Built-in default callbacks (e.g., ExecutionIdxUpdateCallback, IssueDetectionExecutionCallback).
+        2. Custom callbacks registered via the RAY_DATA_EXECUTION_CALLBACKS environment variable.
+        3. Custom callbacks programmatically added to `custom_execution_callback_classes`.
+
+        Note: `LoadCheckpointCallback` is NOT included here because it requires
+        a `CheckpointConfig` argument to be instantiated. It is conditionally added
+        later directly by the execution planner.
+
+        Returns:
+            A list of ExecutionCallback class types (not instances).
+        """
+        from ray.data._internal.execution.callbacks.execution_idx_update_callback import (
+            ExecutionIdxUpdateCallback,
+        )
+        from ray.data._internal.execution.callbacks.insert_issue_detectors import (
+            IssueDetectionExecutionCallback,
+        )
+        from ray.data._internal.execution.execution_callback import ExecutionCallback
+
+        classes = [
+            ExecutionIdxUpdateCallback,
+            IssueDetectionExecutionCallback,
+        ]
+
+        # Parse environment variable for custom callbacks
+        env_callbacks = os.environ.get(EXECUTION_CALLBACKS_ENV_VAR, "")
+
+        if env_callbacks:
+            for callback_path in env_callbacks.split(","):
+                callback_path = callback_path.strip()
+                if not callback_path:
+                    continue
+                try:
+                    module_path, class_name = callback_path.rsplit(".", 1)
+                    module = importlib.import_module(module_path)
+                    callback_cls = getattr(module, class_name)
+                except (ImportError, AttributeError, ValueError) as e:
+                    raise ValueError(
+                        f"Failed to import callback from '{callback_path}': {e}"
+                    )
+
+                if not isinstance(callback_cls, type) or not issubclass(
+                    callback_cls, ExecutionCallback
+                ):
+                    raise ValueError(
+                        f"Invalid callback class '{callback_path}' specified in "
+                        f"{EXECUTION_CALLBACKS_ENV_VAR}. Expected a subclass of "
+                        f"ExecutionCallback, but got {callback_cls}."
+                    )
+
+                classes.append(callback_cls)
+
+        # User custom classes
+        classes.extend(self.custom_execution_callback_classes)
+
+        return classes
 
     def get_config(self, key: str, default: Any = None) -> Any:
         """Get the value for a key-value style config.
@@ -798,6 +950,34 @@ class DataContext:
         workers.
         """
         self.dataset_logger_id = dataset_id
+
+    @property
+    def checkpoint_config(self) -> Optional[CheckpointConfig]:
+        """Get the checkpoint configuration."""
+        return self._checkpoint_config
+
+    @checkpoint_config.setter
+    def checkpoint_config(
+        self, value: Optional[Union[CheckpointConfig, Dict[str, Any]]]
+    ) -> None:
+        """Set the checkpoint configuration."""
+        if value is None:
+            self._checkpoint_config = None
+        elif isinstance(value, dict):
+            if "override_backend" in value:
+                if not isinstance(value["override_backend"], str):
+                    raise TypeError(
+                        "Expected 'override_backend' to be a string,"
+                        f" but got {type(value['override_backend'])}."
+                    )
+                value["override_backend"] = CheckpointBackend[value["override_backend"]]
+            self._checkpoint_config = CheckpointConfig(**value)
+        elif isinstance(value, CheckpointConfig):
+            self._checkpoint_config = value
+        else:
+            raise TypeError(
+                "checkpoint_config must be a CheckpointConfig instance, a dict, or None."
+            )
 
 
 # Backwards compatibility alias.
