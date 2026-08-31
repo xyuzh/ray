@@ -9,6 +9,11 @@ import time
 import uuid
 from typing import Callable, Dict, List, Optional, Union
 
+from ray.experimental.sandbox._internal.idmap import (
+    IdMap,
+    detect_idmap,
+    remove_tree_as_mapped_root,
+)
 from ray.experimental.sandbox.backend.base import (
     BaseSandboxBackend,
     ExecResult,
@@ -87,7 +92,12 @@ class GVisorSandboxBackend(BaseSandboxBackend):
                 "gVisor executable 'runsc' not found in PATH. "
                 "Please install gVisor (runsc) on the node."
             )
-        if config.network == "public":
+        use_pasta = config.network == "public"
+        # Multi-uid mapping when the node provides subuid ranges and the
+        # setuid helpers; None degrades to the single-uid holder (warn-once
+        # inside detect_idmap).
+        idmap = detect_idmap() if use_pasta else None
+        if use_pasta:
             missing = [b for b in ("pasta", "nsenter") if not shutil.which(b)]
             if missing:
                 raise SandboxCreationError(
@@ -142,7 +152,16 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             ) from err
 
         # Prepare OCI bundle config for long-running container process
+        rootfs_override = None
         try:
+            if idmap is not None:
+                # Multi-uid sandboxes mount the ownership-true rootfs variant
+                # so ownership baked into the image (distinct uids, setuid
+                # dirs) survives; everyone else keeps the shared worker-owned
+                # rootfs.
+                rootfs_override = self._image_manager.ensure_idmapped_rootfs(
+                    config.image, idmap, timeout_seconds=config.timeout_seconds
+                )
             self._image_manager.prepare_oci_bundle(
                 root_dir=root_dir,
                 workdir_path=workdir_path,
@@ -155,6 +174,7 @@ class GVisorSandboxBackend(BaseSandboxBackend):
                 capabilities=config.capabilities,
                 network=config.network,
                 dns=config.dns,
+                rootfs_path=rootfs_override,
                 _oci_spec_transform_fn=config._oci_spec_transform_fn,
             )
         except Exception:
@@ -162,7 +182,9 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             raise
         overlay_dir = os.path.join(root_dir, "overlay")
         os.makedirs(overlay_dir, mode=0o777, exist_ok=True)
-        run_args = self._build_run_command(config, root_dir, overlay_dir, sandbox_id)
+        run_args = self._build_run_command(
+            config, root_dir, overlay_dir, sandbox_id, idmap=idmap
+        )
 
         stderr_log_path = os.path.join(root_dir, "runsc.stderr.log")
         stderr_file = open(stderr_log_path, "w+", encoding="utf-8")
@@ -222,7 +244,7 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             self._delete_container_state(config, sandbox_id)
             self._terminate_tree(proc)
             stderr_file.close()
-            shutil.rmtree(root_dir, ignore_errors=True)
+            self._remove_root_dir(root_dir, idmap)
             # The sandbox never registered, so delete_sandbox will not run
             # for it: release the image here to keep it evictable.
             self._image_manager.release_image(config.image, sandbox_id)
@@ -238,6 +260,7 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             "proc": proc,
             "stderr_file": stderr_file,
             "status": SandboxStatus.RUNNING,
+            "idmap": idmap,
         }
         return sandbox_id
 
@@ -271,9 +294,20 @@ class GVisorSandboxBackend(BaseSandboxBackend):
                 except Exception:
                     pass
 
-            shutil.rmtree(root_dir, ignore_errors=True)
+            self._remove_root_dir(root_dir, meta.get("idmap"))
             # Only now is the overlay's lower layer unused.
             self._image_manager.release_image(config.image, sandbox_id)
+
+    def _remove_root_dir(self, root_dir: str, idmap: Optional[IdMap]) -> None:
+        """Remove a sandbox's directory, including subordinate-owned files.
+
+        A multi-uid sandbox can chown files under its workdir bind to ids the
+        worker cannot delete from the initial namespace; those go through a
+        namespace mapped with the sandbox's ``idmap``.
+        """
+        shutil.rmtree(root_dir, ignore_errors=True)
+        if idmap is not None and os.path.lexists(root_dir):
+            remove_tree_as_mapped_root(root_dir, idmap)
 
     def exec_command(
         self,
@@ -431,12 +465,21 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             pass
 
     def _build_run_command(
-        self, config: SandboxConfig, root_dir: str, overlay_dir: str, sandbox_id: str
+        self,
+        config: SandboxConfig,
+        root_dir: str,
+        overlay_dir: str,
+        sandbox_id: str,
+        idmap: Optional[IdMap] = None,
     ) -> List[str]:
         """Build the full `runsc run` argv, pasta-wrapped for network="public".
 
         Pure argv construction (no filesystem side effects) so tests can
-        assert the exact command without runsc or pasta installed.
+        assert the exact command without runsc or pasta installed. With
+        ``idmap``, the holder namespace gets a multi-uid mapping via the
+        setuid newuidmap/newgidmap helpers instead of ``--map-root-user``,
+        so in-sandbox files can be owned by distinct uids; ``idmap=None``
+        keeps the single-uid script byte-identical to before.
         """
         args = self._runsc_base_args(config)
         use_pasta = config.network == "public"
@@ -462,10 +505,44 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             pasta_pidfile = shlex.quote(os.path.join(root_dir, "pasta.pid"))
             runsc = " ".join(shlex.quote(a) for a in args)
             pasta = " ".join(["pasta", *_PASTA_FLAGS])
+            if idmap is not None:
+                # The holder starts unmapped (DAC is kuid-based, so writing
+                # the pidfile into the 0777 root_dir and sleeping both work;
+                # ids merely read as the overflow uid until mapped). The
+                # maps are then written exactly once into the fresh empty
+                # uid_map/gid_map — container root onto the worker's own
+                # ids, 1..count onto the subordinate range — before pasta
+                # and nsenter join as mapped root. Plain --user never
+                # writes setgroups=deny, so newgidmap works. &&-chaining
+                # surfaces a map failure through runsc.stderr.log. On
+                # nodes whose setuid helpers don't elevate (stripped bits),
+                # detection selects privileged direct map-file writes
+                # instead — shadow's helpers refuse cross-user targets, so
+                # sudo-ing them is never an option.
+                holder = "unshare --user --net --fork --kill-child "
+                if idmap.sudo_mapfile:
+                    maps = (
+                        'sudo -n sh -c "'
+                        f"printf '0 {idmap.euid} 1\n1 {idmap.subuid_base}"
+                        f" {idmap.subuid_count}\n' > /proc/$NSPID/uid_map"
+                        f" && printf '0 {idmap.egid} 1\n1"
+                        f" {idmap.subgid_base} {idmap.subgid_count}\n'"
+                        ' > /proc/$NSPID/gid_map" && '
+                    )
+                else:
+                    maps = (
+                        f"newuidmap $NSPID 0 {idmap.euid} 1"
+                        f" 1 {idmap.subuid_base} {idmap.subuid_count} && "
+                        f"newgidmap $NSPID 0 {idmap.egid} 1"
+                        f" 1 {idmap.subgid_base} {idmap.subgid_count} && "
+                    )
+            else:
+                holder = "unshare --user --map-root-user --net --fork --kill-child "
+                maps = ""
             script = (
                 # The holder pins the namespaces for the sandbox's lifetime;
                 # --kill-child ties it to this script's process group.
-                "unshare --user --map-root-user --net --fork --kill-child "
+                f"{holder}"
                 f"bash -c 'echo $$ > {netns_pidfile}; exec sleep infinity' & "
                 "HOLDER=$!; "
                 # Stop waiting as soon as the holder dies, and refuse an
@@ -474,6 +551,7 @@ class GVisorSandboxBackend(BaseSandboxBackend):
                 "kill -0 $HOLDER 2>/dev/null || break; sleep 0.1; done; "
                 f"NSPID=$(cat {netns_pidfile} 2>/dev/null); "
                 '[ -n "$NSPID" ] || { echo "netns holder failed to start" >&2; exit 1; }; '
+                f"{maps}"
                 # pasta attaches from the pod side and stays in the
                 # foreground, so it lives and dies with this process group.
                 # It writes --pid once initialised: that is the go signal.

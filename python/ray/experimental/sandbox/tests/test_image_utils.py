@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sys
 import tarfile
@@ -7,7 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ray.experimental.sandbox._internal.idmap import IdMap
 from ray.experimental.sandbox._internal.image_utils import (
+    EXTRACT_MARKER,
+    OWNERSHIP_SIDECAR,
+    ensure_idmapped_rootfs,
     extract_tar_layer,
     get_platform_arch,
     get_registry_auth_headers,
@@ -431,6 +436,159 @@ def test_get_registry_auth_headers_no_auth_needed():
             "localhost:5000", "my/repo", reference="latest"
         )
         assert headers == {}
+
+
+def _add_member(tar, name, data=b"", uid=0, gid=0, mode=0o644, typ=tarfile.REGTYPE):
+    ti = tarfile.TarInfo(name)
+    ti.uid = uid
+    ti.gid = gid
+    ti.mode = mode
+    ti.type = typ
+    if typ == tarfile.REGTYPE:
+        ti.size = len(data)
+        tar.addfile(ti, io.BytesIO(data))
+    else:
+        tar.addfile(ti)
+
+
+def test_extract_tar_layer_ownership_recording(tmp_path):
+    """The ownership map accumulates across layers and honors whiteouts —
+    modeled on the mailman image (uid=101 spool dirs, opaque whiteout)."""
+    dest = tmp_path / "rootfs"
+    dest.mkdir()
+    ownership = {}
+
+    buf1 = io.BytesIO()
+    with tarfile.open(fileobj=buf1, mode="w:gz") as tar:
+        _add_member(
+            tar, "var/spool/postfix/defer", uid=101, mode=0o700, typ=tarfile.DIRTYPE
+        )
+        _add_member(
+            tar,
+            "var/spool/postfix/maildrop",
+            uid=101,
+            gid=104,
+            mode=0o1730,
+            typ=tarfile.DIRTYPE,
+        )
+        _add_member(
+            tar,
+            "var/lib/mailman3/data",
+            uid=38,
+            gid=38,
+            mode=0o755,
+            typ=tarfile.DIRTYPE,
+        )
+        _add_member(tar, "var/lib/mailman3/data/gone.txt", b"x", uid=38, gid=38)
+        _add_member(tar, "etc/passwd", b"root:x:0:0::/root:/bin/sh\n")
+    extract_tar_layer(buf1.getvalue(), str(dest), ownership=ownership)
+
+    assert ownership == {
+        "var/spool/postfix/defer": (101, 0),
+        "var/spool/postfix/maildrop": (101, 104),
+        "var/lib/mailman3/data": (38, 38),
+        "var/lib/mailman3/data/gone.txt": (38, 38),
+    }
+
+    # Layer 2: deletion whiteout drops the file; opaque whiteout clears the
+    # mailman3 subtree; a root-owned replacement records nothing.
+    buf2 = io.BytesIO()
+    with tarfile.open(fileobj=buf2, mode="w:gz") as tar:
+        _add_member(tar, "var/spool/postfix/.wh.maildrop")
+        _add_member(tar, "var/lib/mailman3/.wh..wh..opq")
+        _add_member(tar, "var/lib/mailman3/fresh.txt", b"y")
+    extract_tar_layer(buf2.getvalue(), str(dest), ownership=ownership)
+
+    assert ownership == {"var/spool/postfix/defer": (101, 0)}
+
+
+def test_local_tar_pull_writes_sidecar_and_versioned_marker(tmp_path):
+    local_tar = tmp_path / "sample.tar"
+    with tarfile.open(str(local_tar), "w") as tar:
+        _add_member(tar, "opt/data", uid=38, gid=38, mode=0o750, typ=tarfile.DIRTYPE)
+        _add_member(tar, "opt/data/f.txt", b"z", uid=38, gid=38)
+        _add_member(tar, "etc/hosts", b"127.0.0.1 localhost\n")
+
+    images_dir = tmp_path / "images"
+    extracted_dir = pull_and_extract_container_image(
+        str(local_tar), images_dir=str(images_dir)
+    )
+    marker = os.path.join(extracted_dir, ".extracted")
+    assert open(marker, encoding="utf-8").read() == EXTRACT_MARKER
+    sidecar = json.load(open(os.path.join(extracted_dir, OWNERSHIP_SIDECAR)))
+    assert sidecar == {"opt/data": [38, 38], "opt/data/f.txt": [38, 38]}
+
+
+def test_stale_marker_triggers_reextract(tmp_path):
+    local_tar = tmp_path / "sample.tar"
+    with tarfile.open(str(local_tar), "w") as tar:
+        _add_member(tar, "hello.txt", b"hi")
+
+    images_dir = tmp_path / "images"
+    extracted_dir = pull_and_extract_container_image(
+        str(local_tar), images_dir=str(images_dir)
+    )
+    marker = os.path.join(extracted_dir, ".extracted")
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write("ok")  # legacy format
+    again = pull_and_extract_container_image(str(local_tar), images_dir=str(images_dir))
+    assert again == extracted_dir
+    assert open(marker, encoding="utf-8").read() == EXTRACT_MARKER
+
+
+def test_ensure_idmapped_rootfs_requires_current_cache(tmp_path):
+    images_dir = tmp_path / "images"
+    target = images_dir / "img_latest"
+    target.mkdir(parents=True)
+    (target / ".extracted").write_text("ok")  # legacy
+    idmap = IdMap(1000, 1000, 100000, 65536, 100000, 65536)
+    with pytest.raises(SandboxCreationError, match="predates ownership-aware"):
+        ensure_idmapped_rootfs("img:latest", idmap, images_dir=str(images_dir))
+
+
+def test_apply_ownership_chowns_then_restores_mode(tmp_path, monkeypatch):
+    """The idmapped copy applies sidecar owners and puts back the setuid/setgid
+    bits that chown clears; symlinks are lchowned without a chmod."""
+    from ray.experimental.sandbox._internal import idmap_extract
+
+    calls = []
+    monkeypatch.setattr(
+        "ray.experimental.sandbox._internal.image_utils.os.lchown",
+        lambda path, uid, gid: calls.append(("lchown", path, uid, gid)),
+    )
+    real_chmod = os.chmod
+    monkeypatch.setattr(
+        idmap_extract.os,
+        "chmod",
+        lambda path, mode: (
+            calls.append(("chmod", path, mode)),
+            real_chmod(path, mode),
+        ),
+    )
+    dest = tmp_path / "rootfs"
+    (dest / "spool").mkdir(parents=True)
+    tool = dest / "spool" / "suid-tool"
+    tool.write_bytes(b"#!")
+    real_chmod(tool, 0o4750)
+    (dest / "spool" / "link").symlink_to("suid-tool")
+
+    idmap_extract.apply_ownership(
+        str(dest),
+        {
+            "spool": (101, 0),
+            "spool/suid-tool": (101, 104),
+            "spool/link": (101, 0),
+            "gone": (1, 1),
+        },
+    )
+
+    assert calls == [
+        ("lchown", str(dest / "spool"), 101, 0),
+        ("chmod", str(dest / "spool"), 0o755),
+        ("lchown", str(tool), 101, 104),
+        ("chmod", str(tool), 0o4750),
+        ("lchown", str(dest / "spool" / "link"), 101, 0),
+    ]
 
 
 if __name__ == "__main__":

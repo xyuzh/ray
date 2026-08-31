@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from ray.experimental.sandbox._internal.image_utils import (
     DEFAULT_IMAGES_DIR,
     _release_image_use,
+    ensure_idmapped_rootfs,
     pull_and_extract_container_image,
     sanitize_image_name,
 )
@@ -157,6 +158,7 @@ class BaseImageManager(ABC):
         resolv_conf_source: Optional[str] = None,
         hosts_source: Optional[str] = None,
         base_spec: Optional[Dict[str, Any]] = None,
+        rootfs_path: Optional[str] = None,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> Dict[str, Any]:
         """Construct an OCI container configuration specification dictionary.
@@ -181,6 +183,9 @@ class BaseImageManager(ABC):
                 /etc/hosts (a per-sandbox copy, like the one container
                 engines inject).
             base_spec: Optional base OCI spec dict to modify instead of generating a default.
+            rootfs_path: Optional host rootfs directory to mount instead of the
+                image's shared ``rootfs/`` (e.g. the ownership-true idmapped
+                variant for multi-uid sandboxes).
             _oci_spec_transform_fn: Optional callback to transform the final spec.
 
         Returns:
@@ -202,6 +207,7 @@ class BaseImageManager(ABC):
         capabilities: Optional[List[str]] = None,
         network: str = "none",
         dns: Optional[List[str]] = None,
+        rootfs_path: Optional[str] = None,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> str:
         """Prepare an OCI bundle directory containing config.json for a container instance.
@@ -220,12 +226,24 @@ class BaseImageManager(ABC):
             network: Sandbox network mode; picks the resolv.conf to mount
                 ("public"/dns: generated, "host": the host's own).
             dns: Optional nameserver IPs for the generated resolv.conf.
+            rootfs_path: Optional rootfs override (see create_oci_spec).
             _oci_spec_transform_fn: Optional OCI spec transform function.
 
         Returns:
             Path to the written config.json file.
         """
         pass
+
+    def ensure_idmapped_rootfs(
+        self, image: str, idmap: Any, timeout_seconds: float = 120.0
+    ) -> str:
+        """Materialize the ownership-true rootfs variant for multi-uid use.
+
+        Only meaningful for cache-backed managers; others don't support it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support idmapped rootfs variants"
+        )
 
 
 class ImageManager(BaseImageManager):
@@ -273,6 +291,21 @@ class ImageManager(BaseImageManager):
             instance_id: The sandbox instance that no longer uses the image.
         """
         _release_image_use(self.get_image_dir(image), instance_id)
+
+    def ensure_idmapped_rootfs(
+        self, image: str, idmap: Any, timeout_seconds: float = 120.0
+    ) -> str:
+        """Materialize the ownership-true rootfs variant for multi-uid use.
+
+        Requires a prior ``pull_image`` under the current cache format;
+        serialized against pulls by the per-image lock.
+        """
+        return ensure_idmapped_rootfs(
+            image,
+            idmap,
+            images_dir=self._images_dir,
+            timeout_seconds=timeout_seconds,
+        )
 
     def get_image_dir(self, image: str) -> str:
         """Get the cached local directory path for an image.
@@ -367,6 +400,7 @@ class ImageManager(BaseImageManager):
         resolv_conf_source: Optional[str] = None,
         hosts_source: Optional[str] = None,
         base_spec: Optional[Dict[str, Any]] = None,
+        rootfs_path: Optional[str] = None,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> Dict[str, Any]:
         """Construct an OCI container configuration specification dictionary.
@@ -391,6 +425,10 @@ class ImageManager(BaseImageManager):
                 /etc/hosts (a per-sandbox copy, like the one container
                 engines inject).
             base_spec: Optional base OCI spec dict to modify instead of generating a default.
+            rootfs_path: Optional host rootfs directory to mount instead of the
+                shared worker-owned image extraction (e.g. the ownership-true
+                idmapped tree for a multi-uid sandbox). None uses the image's
+                own rootfs.
             _oci_spec_transform_fn: Optional callback to transform the final spec.
 
         Returns:
@@ -403,7 +441,10 @@ class ImageManager(BaseImageManager):
         )
 
         image_dir = self.pull_image(image)
-        rootfs = os.path.join(image_dir, "rootfs")
+        # An explicit override mounts a rootfs variant (e.g. the
+        # ownership-true idmapped tree for multi-uid sandboxes) instead of
+        # the shared worker-owned extraction.
+        rootfs = rootfs_path or os.path.join(image_dir, "rootfs")
 
         spec.setdefault("root", {})
         spec["root"]["path"] = rootfs
@@ -576,6 +617,7 @@ class ImageManager(BaseImageManager):
         capabilities: Optional[List[str]] = None,
         network: str = "none",
         dns: Optional[List[str]] = None,
+        rootfs_path: Optional[str] = None,
         _oci_spec_transform_fn: Optional[Callable[[Dict], Optional[Dict]]] = None,
     ) -> str:
         """Prepare an OCI bundle directory containing config.json for a container instance.
@@ -594,6 +636,10 @@ class ImageManager(BaseImageManager):
             network: Sandbox network mode; picks the resolv.conf to mount
                 ("public"/dns: generated, "host": the host's own).
             dns: Optional nameserver IPs for the generated resolv.conf.
+            rootfs_path: Optional host rootfs directory forwarded to
+                create_oci_spec, overriding the image's shared extraction
+                (e.g. the idmapped tree for a multi-uid sandbox). None uses
+                the image's own rootfs.
             _oci_spec_transform_fn: Optional OCI spec transform function.
 
         Returns:
@@ -645,6 +691,7 @@ class ImageManager(BaseImageManager):
             network=network,
             resolv_conf_source=resolv_conf_source,
             hosts_source=hosts_source,
+            rootfs_path=rootfs_path,
             _oci_spec_transform_fn=_oci_spec_transform_fn,
         )
 
