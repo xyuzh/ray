@@ -267,9 +267,8 @@ def test_image_cache_max_bytes_default_and_env(tmp_path, monkeypatch, caplog):
     assert "RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES" in caplog.text
 
 
-def test_pull_and_extract_remote_image(tmp_path, monkeypatch):
+def test_pull_and_extract_remote_image(tmp_path):
     images_dir = tmp_path / "images"
-    monkeypatch.delenv("RAY_SANDBOX_KEEP_IMAGE_TARBALL", raising=False)
     extracted_dir = pull_and_extract_container_image(
         "busybox:latest", images_dir=str(images_dir)
     )
@@ -278,16 +277,8 @@ def test_pull_and_extract_remote_image(tmp_path, monkeypatch):
     assert os.path.exists(
         os.path.join(extracted_dir, "rootfs", "bin", "sh")
     ) or os.path.exists(os.path.join(extracted_dir, "rootfs", "bin", "busybox"))
-    # The uncompressed tarball is opt-in: it doubled every image's cache
-    # footprint (see RAY_SANDBOX_KEEP_IMAGE_TARBALL).
+    # Only the extracted rootfs is cached; no archive doubles its footprint.
     assert not os.path.exists(str(images_dir / "busybox_latest.tar"))
-
-
-def test_pull_keeps_tarball_when_opted_in(tmp_path, monkeypatch):
-    images_dir = tmp_path / "images"
-    monkeypatch.setenv("RAY_SANDBOX_KEEP_IMAGE_TARBALL", "1")
-    pull_and_extract_container_image("busybox:latest", images_dir=str(images_dir))
-    assert os.path.exists(str(images_dir / "busybox_latest.tar"))
 
 
 def test_pull_and_extract_docker_io_prefixed_image(tmp_path):

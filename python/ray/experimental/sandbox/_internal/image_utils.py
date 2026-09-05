@@ -361,7 +361,6 @@ def extract_tar_layer(
 
 
 _IMAGE_CACHE_MAX_BYTES_ENV = "RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES"
-_KEEP_IMAGE_TARBALL_ENV = "RAY_SANDBOX_KEEP_IMAGE_TARBALL"
 # Subdirectory of each cached image holding one marker file per live sandbox.
 _USERS_SUBDIR = ".users"
 
@@ -448,8 +447,8 @@ def evict_least_recently_used_images(
 
     Nodes cache every image they ever ran, so without a cap a long-lived
     node eventually fills its disk. Candidates are fully extracted images
-    (``.extracted`` marker present) and orphan ``<name>.tar`` archives,
-    oldest first. An image is skipped when a live sandbox uses it, when its
+    (``.extracted`` marker present) and ``<name>.tar`` archives left behind
+    by earlier Ray versions, oldest first. An image is skipped when a live sandbox uses it, when its
     per-image lock is held (a pull in progress), or when it is ``keep``. The
     in-use check is repeated under the lock, which is also where pulls
     register their users, so a marked image is never removed.
@@ -469,7 +468,7 @@ def evict_least_recently_used_images(
         if name.endswith(".tar") and os.path.isfile(path):
             stem = name[: -len(".tar")]
             if not os.path.isdir(os.path.join(images_dir, stem)):
-                # Orphan archive from the pre-opt-in default.
+                # Archive without an image: left by an earlier Ray version.
                 try:
                     entries.append(
                         (
@@ -577,8 +576,6 @@ def pull_and_extract_container_image(
             tmp_rootfs_dir = os.path.join(tmp_extract_dir, "rootfs")
             os.makedirs(tmp_rootfs_dir, mode=0o755, exist_ok=True)
 
-            tar_path = os.path.join(images_dir, f"{safe_name}.tar")
-
             if os.path.isfile(image):
                 try:
                     with open(image, "rb") as f:
@@ -587,15 +584,6 @@ def pull_and_extract_container_image(
                     shutil.rmtree(tmp_extract_dir, ignore_errors=True)
                     raise SandboxCreationError(
                         f"Failed to extract local image archive '{image}': {err}"
-                    ) from err
-            elif os.path.isfile(tar_path):
-                try:
-                    with open(tar_path, "rb") as f:
-                        extract_tar_layer(f, tmp_extract_dir)
-                except Exception as err:
-                    shutil.rmtree(tmp_extract_dir, ignore_errors=True)
-                    raise SandboxCreationError(
-                        f"Failed to extract cached image archive '{tar_path}': {err}"
                     ) from err
             else:
                 if (
@@ -703,20 +691,8 @@ def pull_and_extract_container_image(
                                 tmp_blob_file.seek(0)
                                 extract_tar_layer(tmp_blob_file, tmp_rootfs_dir)
 
-                    # The uncompressed tarball doubles every image's disk
-                    # footprint for a rarely-exercised restore path; keep it
-                    # only on request.
-                    if os.environ.get(_KEEP_IMAGE_TARBALL_ENV) == "1":
-                        with tarfile.open(tar_path, "w") as tar:
-                            tar.add(tmp_extract_dir, arcname=".")
-
                 except Exception as err:
                     shutil.rmtree(tmp_extract_dir, ignore_errors=True)
-                    if os.path.exists(tar_path):
-                        try:
-                            os.remove(tar_path)
-                        except OSError:
-                            pass
                     if isinstance(err, SandboxCreationError):
                         raise
                     raise SandboxCreationError(
