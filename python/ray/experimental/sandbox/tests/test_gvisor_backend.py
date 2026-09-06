@@ -83,7 +83,8 @@ def test_gvisor_backend_container_image_support():
         assert os.path.exists(extracted_dir)
         assert os.path.isdir(extracted_dir)
         assert os.path.exists(os.path.join(extracted_dir, ".extracted"))
-        assert os.path.exists("/tmp/ray/sandbox/images/busybox_latest.tar")
+        # Only the extracted rootfs is cached; no archive doubles its footprint.
+        assert not os.path.exists("/tmp/ray/sandbox/images/busybox_latest.tar")
 
         res = backend.exec_command(sandbox_id, "/bin/sh -c 'echo hello from busybox'")
         assert res.exit_code == 0
