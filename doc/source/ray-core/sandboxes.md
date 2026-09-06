@@ -245,8 +245,6 @@ Sandboxes boot from OCI container images. The image manager pulls an image strai
 
 The cache is bounded so that a node that runs many distinct images doesn't fill its disk. Before each pull, Ray evicts the least recently extracted images until the cache fits under the cap. Images that a running sandbox uses are never evicted. The cap defaults to half of the filesystem that holds the cache. Set `RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES` on worker nodes to choose a cap in bytes, or set it to `0` to disable eviction.
 
-Ray caches only the extracted root filesystem. Earlier versions also wrote an uncompressed `<image>.tar` archive next to it; leftover archives count toward the cap and are evicted with their image.
-
 ### Route Docker Hub pulls through a mirror
 
 Because image pulls are anonymous, every node pulling from Docker Hub consumes the anonymous pull-rate limit and downloads the image over the WAN. In a large cluster, concurrent pulls of multi-GB images can quickly hit the rate limit or saturate network bandwidth, causing image pulls to fail or become slow.
